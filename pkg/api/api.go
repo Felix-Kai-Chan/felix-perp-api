@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/chantrumps/felix-perp-core/felix-perp-orderbook/pkg/book"
@@ -45,6 +46,7 @@ func New(ob *book.Orderbook, m *matcher.Matcher, st *store.Store) *Server {
 // RegisterMux 把路由挂到调用方传入的 mux 上（main 负责起 http.Server）。
 func (s *Server) RegisterMux(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/orders", s.handleOrders)
+	mux.HandleFunc("DELETE /api/orders", s.handleCancel)
 	mux.HandleFunc("GET /api/depth", s.handleDepth)
 	mux.HandleFunc("GET /api/margin", s.handleMargin)
 	s.mux = mux
@@ -68,9 +70,32 @@ func (s *Server) handleOrders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	side := types.SideBuy
-	if req.Side == "SELL" {
-		side = types.SideSell
+	// 1) 客户端订单号必填且唯一，避免覆盖已在簿订单 / 产生空 ID。
+	req.ClientOrderID = strings.TrimSpace(req.ClientOrderID)
+	if req.ClientOrderID == "" {
+		http.Error(w, "client_order_id is required", http.StatusBadRequest)
+		return
+	}
+	if _, exists := s.ob.GetOrder(req.ClientOrderID); exists {
+		http.Error(w, "client_order_id already exists", http.StatusConflict)
+		return
+	}
+
+	// 2) 方向严格校验：大小写/空格容错，非法值直接 400（不再默认 BUY）。
+	side, err := parseSide(req.Side)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// 3) 价格、数量必须为正，否则撮合/保证金计算会出现 0 量或负名义值。
+	if req.Price <= 0 {
+		http.Error(w, "price must be positive", http.StatusBadRequest)
+		return
+	}
+	if req.Qty <= 0 {
+		http.Error(w, "qty must be positive", http.StatusBadRequest)
+		return
 	}
 
 	order := &types.Order{
@@ -126,6 +151,42 @@ func (s *Server) handleOrders(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// parseSide 严格解析方向：BUY/SELL（大小写、首尾空格容错），其余报错。
+func parseSide(s string) (types.Side, error) {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "BUY":
+		return types.SideBuy, nil
+	case "SELL":
+		return types.SideSell, nil
+	default:
+		return types.SideBuy, &badSideError{v: s}
+	}
+}
+
+type badSideError struct{ v string }
+
+func (e *badSideError) Error() string {
+	return "bad side " + strconv.Quote(e.v) + ": want BUY/SELL"
+}
+
+// ---------- 撤单 ----------
+
+// handleCancel 按 client_order_id 撤单：DELETE /api/orders?id=<client_order_id>
+// 若该单已被撮合吃光或从未存在（已从 orderMap 删除），返回 404。
+func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		http.Error(w, "id is required (?id=<client_order_id>)", http.StatusBadRequest)
+		return
+	}
+	if !s.ob.CancelOrder(id) {
+		http.Error(w, "order not found or already filled", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"ok": true, "cancelled": id})
+}
+
 // ---------- 深度 ----------
 
 func (s *Server) handleDepth(w http.ResponseWriter, r *http.Request) {
@@ -179,8 +240,13 @@ func (s *Server) handleMargin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid mark price", http.StatusBadRequest)
 		return
 	}
-	// 关键：mark 与持仓 AvgPrice 同尺度（1e8），否则 can_liquidate 会错位。
-	markPrice := big.NewInt(int64(markF * scale))
+	if markF <= 0 {
+		http.Error(w, "mark price must be positive", http.StatusBadRequest)
+		return
+	}
+	// 关键：mark 与持仓 AvgPrice 同尺度（1e8），用 toOnChain 统一四舍五入，
+	// 避免之前 int64(markF*scale) 截断与下单侧取整口径不一致导致 can_liquidate 错位。
+	markPrice := toOnChain(markF)
 
 	positions := s.st.GetAllPositions()
 
